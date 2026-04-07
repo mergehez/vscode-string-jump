@@ -1,0 +1,12 @@
+{
+    "$schema": "./node_modules/oxfmt/configuration_schema.json",
+    "semi": true,
+    "singleQuote": true,
+    "printWidth": 180,
+    "trailingComma": "es5",
+    "tabWidth": 4,
+    "singleAttributePerLine": false,
+    "sortPackageJson": false,
+    "sortImports": true,
+    "ignorePatterns": ["builder.html", "generated_routes.ts", "generated_types.ts"]
+}

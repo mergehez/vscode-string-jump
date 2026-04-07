@@ -1,0 +1,111 @@
+{
+    "name": "string-jump",
+    "displayName": "String Jump",
+    "version": "0.0.1",
+    "description": "Semantic navigation between string literals, declaration names, and definitions in TypeScript and JavaScript.",
+    "keywords": [
+        "string",
+        "string jump",
+        "string go to",
+        "literal",
+        "literal navigation",
+        "go to definition",
+        "navigation",
+        "typescript",
+        "javascript"
+    ],
+    "categories": [
+        "Programming Languages"
+    ],
+    "publisher": "MergeSoft",
+    "icon": "images/icon.png",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/mergehez/vscode-string-jump"
+    },
+    "type": "module",
+    "main": "./dist/extension.js",
+    "exports": {
+        ".": "./dist/extension.js",
+        "./tsserver-plugin": {
+            "types": "./dist/tsserver-plugin.d.cts",
+            "default": "./dist/tsserver-plugin.cjs"
+        }
+    },
+    "scripts": {
+        "build": "node build.ts",
+        "compile": "node build.ts",
+        "watch": "tsc -w -p ./",
+        "pretest": "npm run compile",
+        "test": "node test.ts",
+        "package": "npx vsce package",
+        "publish": "npx vsce publish"
+    },
+    "dependencies": {
+        "typescript": "^6.0.2"
+    },
+    "devDependencies": {
+        "@types/node": "^25.5.2",
+        "@types/vscode": "^1.110.0"
+    },
+    "contributes": {
+        "commands": [
+            {
+                "command": "string-jump.goToDefinition",
+                "title": "String Jump: Go To Definition"
+            }
+        ],
+        "keybindings": [
+            {
+                "command": "string-jump.goToDefinition",
+                "key": "f12",
+                "when": "editorTextFocus && resourceScheme == file && (editorLangId == typescript || editorLangId == typescriptreact || editorLangId == javascript || editorLangId == javascriptreact)"
+            }
+        ],
+        "configuration": {
+            "title": "String Jump",
+            "properties": {
+                "string-jump.hide-declaration": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Hide the declaration under the cursor from reverse-definition results."
+                },
+                "string-jump.hide-imports": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Hide import statements from definition results shown by String Jump."
+                }
+            }
+        },
+        "configurationDefaults": {
+            "editor.gotoLocation.multipleDefinitions": "peek",
+            "[typescript]": {
+                "editor.gotoLocation.multipleDefinitions": "peek"
+            },
+            "[typescriptreact]": {
+                "editor.gotoLocation.multipleDefinitions": "peek"
+            },
+            "[javascript]": {
+                "editor.gotoLocation.multipleDefinitions": "peek"
+            },
+            "[javascriptreact]": {
+                "editor.gotoLocation.multipleDefinitions": "peek"
+            }
+        },
+        "typescriptServerPlugins": [
+            {
+                "name": "string-jump-tsserver-plugin",
+                "enableForWorkspaceTypeScriptVersions": true
+            }
+        ]
+    },
+    "activationEvents": [
+        "onLanguage:javascript",
+        "onLanguage:javascriptreact",
+        "onLanguage:typescript",
+        "onLanguage:typescriptreact"
+    ],
+    "engines": {
+        "vscode": "^1.110.0"
+    }
+}

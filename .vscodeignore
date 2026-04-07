@@ -1,0 +1,13 @@
+src/**
+tsconfig.json
+.vscode/**
+.vscode-test/**
+.env
+.env.example
+**/*.map
+**/*.ts
+node_modules/.bin/**
+.oxfmtrc.json
+.oxlintrc.json
+.DS_Store
+.gitignore
