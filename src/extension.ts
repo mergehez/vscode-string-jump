@@ -76,6 +76,7 @@ const testFileColumn = '[TO-REPLACE-TEST-FILE-COLUMN]';
 const testLogFile = '[TO-REPLACE-TEST-LOG-FILE]';
 const MAX_DECORATED_LITERALS = 200;
 const PROGRAM_CACHE_TTL_MS = 15000;
+const DECORATOR_STARTUP_DELAY_MS = 1200;
 let nextDefinitionTraceId = 0;
 let outputChannel: vscode.OutputChannel | null = null;
 let loggingEnabled = true;
@@ -179,6 +180,7 @@ export function activate(context: vscode.ExtensionContext): void {
     outputChannel = loggingEnabled ? vscode.window.createOutputChannel('String Jump') : null;
     log('extension activated. The extension was built at ' + builtAtLong);
     const enableDecorations = context.extensionMode !== vscode.ExtensionMode.Test;
+    let decoratorStartupTimer: ReturnType<typeof setTimeout> | undefined;
 
     const activateDecorator = (): void => {
         if (enableDecorations) {
@@ -186,8 +188,27 @@ export function activate(context: vscode.ExtensionContext): void {
         }
     };
 
+    const scheduleDecoratorActivation = (): void => {
+        if (!enableDecorations || decoratorStartupTimer) {
+            return;
+        }
+
+        decoratorStartupTimer = setTimeout(() => {
+            decoratorStartupTimer = undefined;
+            activateDecorator();
+        }, DECORATOR_STARTUP_DELAY_MS);
+    };
+
     context.subscriptions.push(linkDecorationType);
-    void configureTsServerPlugin({ restartServer: true });
+    context.subscriptions.push(
+        new vscode.Disposable(() => {
+            if (decoratorStartupTimer) {
+                clearTimeout(decoratorStartupTimer);
+                decoratorStartupTimer = undefined;
+            }
+        })
+    );
+    void configureTsServerPlugin();
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration((event) => {
             if (event.affectsConfiguration('string-jump.hide-declaration') || event.affectsConfiguration('string-jump.hide-imports')) {
@@ -223,11 +244,11 @@ export function activate(context: vscode.ExtensionContext): void {
                     log(`auto test failed: ${error instanceof Error ? error.message : String(error)}`);
                 })
                 .finally(() => {
-                    activateDecorator();
+                    scheduleDecoratorActivation();
                 });
         }, 250);
     } else {
-        activateDecorator();
+        scheduleDecoratorActivation();
     }
 }
 
@@ -291,6 +312,12 @@ async function forceGoToDefinition(uri?: vscode.Uri, positionOrRange?: vscode.Po
     const candidatePositions = getCandidatePositions(editor, positionOrRange);
     log(`force jump requested for ${targetUri.fsPath} with ${candidatePositions.length} candidate position(s)`);
 
+    if (candidatePositions.some((position) => isNativeModuleSpecifierPosition(editor.document, position))) {
+        log('force jump delegating to native VS Code definition for module specifier');
+        await vscode.commands.executeCommand('editor.action.revealDefinition');
+        return;
+    }
+
     const targets = await findDefinitionTargets(editor.document, candidatePositions);
     if (targets.length === 0) {
         log('force jump found no definition target');
@@ -321,6 +348,12 @@ async function forceGoToDefinition(uri?: vscode.Uri, positionOrRange?: vscode.Po
 }
 
 async function getDefinitionTargetsAtPosition(document: vscode.TextDocument, position: vscode.Position): Promise<vscode.Location[]> {
+    if (isNativeModuleSpecifierPosition(document, position)) {
+        const definitions = (await vscode.commands.executeCommand('vscode.executeDefinitionProvider', document.uri, position)) as Array<vscode.Location | vscode.LocationLink>;
+        const targets = definitions.map(toLocation).filter((location): location is vscode.Location => location !== undefined);
+        return dedupeLocations(targets);
+    }
+
     const program = createProgramForDocument(document);
     const customTargets = await provideCustomDefinitionsNearPosition(document, position, program, undefined, { allowExternalFallback: false });
     if (customTargets.length > 0) {
@@ -728,7 +761,7 @@ function shouldUseExtensionDefinitionProvider(document: vscode.TextDocument, pos
     const candidates = [position, positionBefore(document, position.translate(0, 1)), positionBefore(document, position)];
 
     for (const candidate of candidates) {
-        if (candidate && findStringLiteralRangeAtPosition(document, candidate)) {
+        if (candidate && findStringLiteralRangeAtPosition(document, candidate) && !isNativeModuleSpecifierPosition(document, candidate)) {
             return true;
         }
 
@@ -738,6 +771,26 @@ function shouldUseExtensionDefinitionProvider(document: vscode.TextDocument, pos
     }
 
     return false;
+}
+
+function isNativeModuleSpecifierPosition(document: vscode.TextDocument, position: vscode.Position): boolean {
+    const sourceFile = ts.createSourceFile(document.fileName, document.getText(), ts.ScriptTarget.Latest, true, scriptKindFor(document));
+    const node = findTsNodeAtOffset(ts, sourceFile, document.offsetAt(position));
+    if (!node || (!ts.isStringLiteral(node) && !ts.isNoSubstitutionTemplateLiteral(node))) {
+        return false;
+    }
+
+    const parent = node.parent;
+    if (!parent) {
+        return false;
+    }
+
+    return (
+        (ts.isImportDeclaration(parent) && parent.moduleSpecifier === node) ||
+        (ts.isExportDeclaration(parent) && parent.moduleSpecifier === node) ||
+        (ts.isExternalModuleReference(parent) && parent.expression === node) ||
+        (ts.isCallExpression(parent) && parent.arguments[0] === node && parent.expression.kind === ts.SyntaxKind.ImportKeyword)
+    );
 }
 
 function isSupportedReverseDeclarationNode(node: ts.Node): node is ts.Declaration & { name: ts.Node } {

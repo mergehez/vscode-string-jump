@@ -1,7 +1,7 @@
 {
     "name": "string-jump",
     "displayName": "String Jump",
-    "version": "0.0.1",
+    "version": "0.0.3",
     "description": "Semantic navigation between string literals, declaration names, and definitions in TypeScript and JavaScript.",
     "keywords": [
         "string",

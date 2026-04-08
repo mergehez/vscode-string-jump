@@ -71,3 +71,5 @@ res = res.replace('[TO-REPLACE-TEST-FILE-LINE]', testFileLine ?? '');
 res = res.replace('[TO-REPLACE-TEST-FILE-COLUMN]', testFileColumn ?? '');
 res = res.replace('[TO-REPLACE-TEST-LOG-FILE]', test ? testLogFile : '');
 fs.writeFileSync('dist/extension.js', res, 'utf-8');
+
+execSync('npx vsce package', { stdio: 'inherit' });

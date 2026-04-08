@@ -11,3 +11,12 @@ node_modules/.bin/**
 .oxlintrc.json
 .DS_Store
 .gitignore
+node_modules/typescript/bin/tsc
+node_modules/typescript/lib/tsc.js
+node_modules/typescript/lib/_tsc.js
+node_modules/typescript/lib/typingsInstaller.js
+node_modules/typescript/lib/_typingsInstaller.js
+node_modules/typescript/lib/watchGuard.js
+node_modules/typescript/lib/**/diagnosticMessages.generated.json
+node_modules/typescript/README.md
+node_modules/typescript/SECURITY.md

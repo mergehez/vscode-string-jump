@@ -179,7 +179,6 @@ async function autoRun() {
         }
 
         if (!skipBuild) {
-            execSync('npx vsce package', { stdio: 'inherit' });
             execSync(`code --install-extension ${vsixFile} --force --profile web`, {
                 stdio: 'inherit',
             });
