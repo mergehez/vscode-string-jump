@@ -15,7 +15,10 @@ const semanticResolver = require('./tsserver-plugin.cjs') as {
 const SUPPORTED_LANGUAGES = new Set(['typescript', 'typescriptreact', 'javascript', 'javascriptreact']);
 
 const linkDecorationType = vscode.window.createTextEditorDecorationType({
-    textDecoration: 'underline',
+    // border: '1px solid',
+
+    border: '1px solid rgb(255 255 255 / 60%)',
+    borderWidth: '0px 0px 1px 0px',
     rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
 });
 
@@ -32,10 +35,13 @@ type CachedDecoration = {
 type DecorationCacheEntry = {
     documentVersion: number;
     decorations: Map<string, CachedDecoration>;
+    /** Literals the server also refused, so a pass does not ask again for the same document version. */
+    withoutTarget: Set<string>;
 };
 
 type DefinitionLookupOptions = {
     allowExternalFallback?: boolean;
+    allowReverse?: boolean;
     cancellationToken?: vscode.CancellationToken;
     trace?: DefinitionTrace;
 };
@@ -50,11 +56,23 @@ type DefinitionTrace = {
 type ProgramCacheEntry = {
     program: ts.Program;
     expiresAt: number;
+    stamp?: string;
+};
+
+type CachedSourceFile = {
+    text: string;
+    sourceFile: ts.SourceFile;
+};
+
+type CachedDocumentSourceFile = {
+    version: number;
+    sourceFile: ts.SourceFile;
 };
 
 type StringJumpSettings = {
     hideDeclaration: boolean;
     hideImports: boolean;
+    trace: boolean;
 };
 
 type TypeScriptExtensionApi = {
@@ -74,15 +92,34 @@ const testFile = '[TO-REPLACE-TEST-FILE]';
 const testFileLine = '[TO-REPLACE-TEST-FILE-LINE]';
 const testFileColumn = '[TO-REPLACE-TEST-FILE-COLUMN]';
 const testLogFile = '[TO-REPLACE-TEST-LOG-FILE]';
-const MAX_DECORATED_LITERALS = 200;
+// The harness rewrites these placeholders after compiling, so they are only empty at runtime.
+const instrumentedBuild = Boolean(testFile);
+const MAX_DECORATED_LITERALS = 2000;
+const DECORATION_DEBOUNCE_MS = 80;
+const DECORATION_YIELD_INTERVAL_MS = 8;
+const MAX_DECORATION_SERVER_FALLBACKS = 60;
 const PROGRAM_CACHE_TTL_MS = 15000;
 const DECORATOR_STARTUP_DELAY_MS = 1200;
+const MAX_LOG_HISTORY = 1000;
+const MAX_CACHED_SOURCE_FILES = 3000;
+const MAX_CACHED_SOURCE_FILE_BYTES = 48 * 1024 * 1024;
+const MAX_CACHED_DOCUMENT_SOURCE_FILES = 20;
+const MAX_REUSED_PROGRAMS = 3;
+const MAX_CACHED_PROGRAMS = 20;
 let nextDefinitionTraceId = 0;
 let outputChannel: vscode.OutputChannel | null = null;
 let loggingEnabled = true;
+let traceEnabled = false;
+let tsServerPluginConfigured = false;
+let delegatingDefinitionLookup = false;
 const logHistory: string[] = [];
 const documentProgramCache = new Map<string, ProgramCacheEntry>();
 const externalProgramCache = new Map<string, ProgramCacheEntry>();
+const sourceFileCache = new Map<string, CachedSourceFile>();
+const documentSourceFileCache = new Map<string, CachedDocumentSourceFile>();
+const previousProgramCache = new Map<string, ts.Program>();
+const skippedDocumentReport = new Set<string>();
+let cachedSourceFileBytes = 0;
 let tsServerRestartTriggered = false;
 const log = (message: string): void => {
     if (!loggingEnabled) {
@@ -93,12 +130,15 @@ const log = (message: string): void => {
     console.log(msg);
     outputChannel?.appendLine(msg);
     logHistory.push(msg);
+
+    if (logHistory.length > MAX_LOG_HISTORY) {
+        logHistory.splice(0, logHistory.length - MAX_LOG_HISTORY);
+    }
 };
 
 function now(): number {
     return Date.now();
 }
-
 function createDefinitionTrace(document: vscode.TextDocument, position: vscode.Position, origin: string): DefinitionTrace {
     return {
         id: ++nextDefinitionTraceId,
@@ -109,24 +149,28 @@ function createDefinitionTrace(document: vscode.TextDocument, position: vscode.P
 }
 
 function traceLog(trace: DefinitionTrace | undefined, message: string): void {
-    if (!trace) {
+    if (!trace || !traceEnabled) {
         return;
     }
 
     log(`[lookup ${trace.id}] ${message}`);
 }
 
+function yieldToEventLoop(): Promise<void> {
+    return new Promise((resolve) => setImmediate(resolve));
+}
+
 function isLookupCancelled(token: vscode.CancellationToken | undefined): boolean {
     return token?.isCancellationRequested ?? false;
 }
 
-function getCachedProgram(cache: Map<string, ProgramCacheEntry>, cacheKey: string): ts.Program | undefined {
+function getCachedProgram(cache: Map<string, ProgramCacheEntry>, cacheKey: string, validateStamp = false): ts.Program | undefined {
     const entry = cache.get(cacheKey);
     if (!entry) {
         return undefined;
     }
 
-    if (entry.expiresAt <= now()) {
+    if (entry.expiresAt <= now() || (validateStamp && entry.stamp !== undefined && entry.stamp !== programStamp(entry.program))) {
         cache.delete(cacheKey);
         return undefined;
     }
@@ -134,13 +178,36 @@ function getCachedProgram(cache: Map<string, ProgramCacheEntry>, cacheKey: strin
     return entry.program;
 }
 
-function setCachedProgram(cache: Map<string, ProgramCacheEntry>, cacheKey: string, program: ts.Program): ts.Program {
+function setCachedProgram(cache: Map<string, ProgramCacheEntry>, cacheKey: string, program: ts.Program, stamp?: string): ts.Program {
+    cache.delete(cacheKey);
     cache.set(cacheKey, {
         program,
         expiresAt: now() + PROGRAM_CACHE_TTL_MS,
+        stamp,
     });
 
+    while (cache.size > MAX_CACHED_PROGRAMS) {
+        const oldestKey = cache.keys().next().value;
+        if (oldestKey === undefined) {
+            break;
+        }
+
+        cache.delete(oldestKey);
+    }
+
     return program;
+}
+
+// Disk-based programs stay valid only while every file they loaded keeps its timestamp, so a
+// save in any imported file invalidates them instead of waiting for the TTL.
+function programStamp(program: ts.Program): string {
+    let stamp = '';
+
+    for (const sourceFile of program.getSourceFiles()) {
+        stamp += `${ts.sys.getModifiedTime?.(sourceFile.fileName)?.getTime() ?? 0}|`;
+    }
+
+    return stamp;
 }
 
 function clearProgramCachesForFile(fileName: string): void {
@@ -178,6 +245,8 @@ async function runAutoTest(): Promise<void> {
 export function activate(context: vscode.ExtensionContext): void {
     loggingEnabled = context.extensionMode !== vscode.ExtensionMode.Test;
     outputChannel = loggingEnabled ? vscode.window.createOutputChannel('String Jump') : null;
+    // Instrumented builds (the test harness) always trace; otherwise it is opt-in.
+    traceEnabled = instrumentedBuild || getStringJumpSettings().trace;
     log('extension activated. The extension was built at ' + builtAtLong);
     const enableDecorations = context.extensionMode !== vscode.ExtensionMode.Test;
     let decoratorStartupTimer: ReturnType<typeof setTimeout> | undefined;
@@ -210,7 +279,13 @@ export function activate(context: vscode.ExtensionContext): void {
     );
     void configureTsServerPlugin();
     context.subscriptions.push(
+        vscode.workspace.onDidCreateFiles(() => forgetWorkspaceSourceFiles()),
+        vscode.workspace.onDidDeleteFiles(() => forgetWorkspaceSourceFiles()),
         vscode.workspace.onDidChangeConfiguration((event) => {
+            if (event.affectsConfiguration('string-jump.trace')) {
+                traceEnabled = instrumentedBuild || getStringJumpSettings().trace;
+            }
+
             if (event.affectsConfiguration('string-jump.hide-declaration') || event.affectsConfiguration('string-jump.hide-imports')) {
                 void configureTsServerPlugin({ restartServer: true, forceRestart: true });
             }
@@ -354,6 +429,15 @@ async function getDefinitionTargetsAtPosition(document: vscode.TextDocument, pos
         return dedupeLocations(targets);
     }
 
+    // With the plugin installed the server answers both directions against its own incremental
+    // program, so ask it before building a local one.
+    if (tsServerPluginConfigured) {
+        const serverTargets = await queryServerDefinitionTargets(document, position);
+        if (serverTargets.length > 0) {
+            return filterDefinitionTargets(document, position, serverTargets);
+        }
+    }
+
     const program = createProgramForDocument(document);
     const customTargets = await provideCustomDefinitionsNearPosition(document, position, program, undefined, { allowExternalFallback: false });
     if (customTargets.length > 0) {
@@ -368,6 +452,19 @@ async function getDefinitionTargetsAtPosition(document: vscode.TextDocument, pos
     const definitions = (await vscode.commands.executeCommand('vscode.executeDefinitionProvider', document.uri, position)) as Array<vscode.Location | vscode.LocationLink>;
     const targets = definitions.map(toLocation).filter((location): location is vscode.Location => location !== undefined);
     return filterDefinitionTargets(document, position, dedupeLocations(targets));
+}
+
+async function queryServerDefinitionTargets(document: vscode.TextDocument, position: vscode.Position): Promise<vscode.Location[]> {
+    delegatingDefinitionLookup = true;
+
+    try {
+        const definitions = (await vscode.commands.executeCommand('vscode.executeDefinitionProvider', document.uri, position)) as Array<vscode.Location | vscode.LocationLink>;
+        return dedupeLocations(definitions.map(toLocation).filter((location): location is vscode.Location => location !== undefined));
+    } catch {
+        return [];
+    } finally {
+        delegatingDefinitionLookup = false;
+    }
 }
 
 async function findDefinitionTargets(document: vscode.TextDocument, positions: readonly vscode.Position[]): Promise<vscode.Location[]> {
@@ -539,50 +636,137 @@ class StringLiteralLinkDecorator implements vscode.Disposable {
         }
 
         const key = editor.document.uri.toString();
-        const existingTimer = this.pendingUpdates.get(key);
-        if (existingTimer) {
-            clearTimeout(existingTimer);
-        }
-
         const version = (this.updateVersions.get(key) ?? 0) + 1;
         this.updateVersions.set(key, version);
 
-        const timer = setTimeout(() => {
-            this.pendingUpdates.delete(key);
-            void this.updateEditor(editor, key, version);
-        }, 80);
+        // A pass that is already scheduled is not postponed: it reads the newest version when it fires, so a
+        // burst of scroll events cannot keep the decorations away.
+        if (this.pendingUpdates.has(key)) {
+            return;
+        }
 
-        this.pendingUpdates.set(key, timer);
+        this.pendingUpdates.set(
+            key,
+            setTimeout(() => {
+                this.pendingUpdates.delete(key);
+                const latestVersion = this.updateVersions.get(key) ?? version;
+
+                // Editors are looked up now rather than captured: the same document can be open in several
+                // editors, and a closed one must not swallow the update for the others.
+                for (const candidate of vscode.window.visibleTextEditors) {
+                    if (candidate.document.uri.toString() === key) {
+                        void this.updateEditor(candidate, key, latestVersion);
+                    }
+                }
+            }, DECORATION_DEBOUNCE_MS)
+        );
     }
 
     private async updateEditor(editor: vscode.TextEditor, key: string, version: number): Promise<void> {
+        try {
+            await this.runDecorationPass(editor, key, version);
+        } catch (error) {
+            // A failing pass must still paint what it already knows: an exception here would otherwise
+            // leave the whole file without underlines, silently.
+            log(`decoration pass failed for ${editor.document.uri.fsPath}: ${error instanceof Error ? error.message : String(error)}`);
+
+            try {
+                this.applyDecorations(editor);
+            } catch {
+                // The editor itself is gone; there is nothing left to paint.
+            }
+        }
+    }
+
+    private applyDecorations(editor: vscode.TextEditor): void {
+        const entry = this.decorationCache.get(editor.document.uri.toString());
+        if (!entry) {
+            editor.setDecorations(this.decorationType, []);
+            return;
+        }
+
+        // VS Code throws and drops the whole call when one range is out of bounds, so filter first.
+        const options = Array.from(entry.decorations.values())
+            .map((cached) => cached.option)
+            .filter((option) => isValidDecorationRange(editor.document, option.range));
+        editor.setDecorations(this.decorationType, options);
+    }
+
+    private async runDecorationPass(editor: vscode.TextEditor, key: string, version: number): Promise<void> {
         if (!shouldProcessDocument(editor.document)) {
             editor.setDecorations(this.decorationType, []);
             return;
         }
 
+        const trace = createDefinitionTrace(editor.document, editor.selection.active, 'decorate');
         const cacheEntry = this.getDecorationCacheEntry(editor.document);
         const literals = collectVisibleLiteralCandidates(editor);
         const pendingLiterals = literals.filter((literal) => !cacheEntry.decorations.has(rangeCacheKey(literal.range)));
+        traceLog(
+            trace,
+            `${editor.document.languageId}/${editor.document.uri.scheme} v${editor.document.version}: ${editor.visibleRanges.length} visible range(s), ${literals.length} literal(s), ${pendingLiterals.length} pending`
+        );
 
         if (pendingLiterals.length === 0) {
-            editor.setDecorations(
-                this.decorationType,
-                Array.from(cacheEntry.decorations.values()).map((entry) => entry.option)
-            );
+            this.applyDecorations(editor);
             return;
         }
 
-        const program = createProgramForDocument(editor.document);
+        const program = createProgramForDocument(editor.document, trace);
+        traceLog(trace, `program ${program ? `with ${program.getSourceFiles().length} file(s)` : 'unavailable'}`);
+        let underlined = 0;
+        let withoutTarget = 0;
+        let failed = 0;
+        let serverFallbacks = 0;
+        let lastYieldAt = now();
 
         for (const literal of pendingLiterals) {
-            const targets = await provideCustomDefinitions(editor.document, literal.positions[0], program, { allowExternalFallback: false });
-            const decorationTarget = targets.find((target) => !isNodeModulesUri(target.uri));
+            if (now() - lastYieldAt >= DECORATION_YIELD_INTERVAL_MS) {
+                await yieldToEventLoop();
+                lastYieldAt = now();
+
+                if (this.updateVersions.get(key) !== version) {
+                    traceLog(trace, `superseded after ${underlined} underline(s)`);
+                    this.paintIfDocumentUnchanged(editor, cacheEntry);
+                    return;
+                }
+            }
+
+            let targets: vscode.Location[] = [];
+            try {
+                targets = await provideCustomDefinitions(editor.document, literal.positions[0], program, {
+                    allowExternalFallback: false,
+                    allowReverse: false,
+                    trace,
+                });
+            } catch (error) {
+                // One unlucky literal must not cost the whole pass its decorations.
+                failed += 1;
+                log(`decoration lookup failed at ${literal.range.start.line + 1}:${literal.range.start.character + 1}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+
+            let decorationTarget = targets.find((target) => !isNodeModulesUri(target.uri));
             if (!decorationTarget) {
-                continue;
+                withoutTarget += 1;
+                const withinFallbackBudget = serverFallbacks < MAX_DECORATION_SERVER_FALLBACKS;
+                if (withinFallbackBudget) {
+                    serverFallbacks += 1;
+                }
+
+                decorationTarget = await this.findServerDecorationTarget(editor.document, literal, cacheEntry, withinFallbackBudget, trace);
+
+                if (!decorationTarget) {
+                    traceLog(
+                        trace,
+                        `no decoration target for ${literal.range.start.line + 1}:${literal.range.start.character + 1} (${targets.length} result(s), all in node_modules: ${targets.length > 0})`
+                    );
+                    continue;
+                }
             }
 
             if (this.updateVersions.get(key) !== version) {
+                traceLog(trace, `superseded after ${underlined} underline(s)`);
+                this.paintIfDocumentUnchanged(editor, cacheEntry);
                 return;
             }
 
@@ -593,16 +777,60 @@ class StringLiteralLinkDecorator implements vscode.Disposable {
                     range: literal.range,
                 },
             });
+            underlined += 1;
         }
 
         if (this.updateVersions.get(key) !== version) {
+            traceLog(trace, `superseded after ${underlined} underline(s)`);
+            this.paintIfDocumentUnchanged(editor, cacheEntry);
             return;
         }
 
-        editor.setDecorations(
-            this.decorationType,
-            Array.from(cacheEntry.decorations.values()).map((entry) => entry.option)
-        );
+        this.applyDecorations(editor);
+        traceLog(trace, `done: ${underlined} underlined (${serverFallbacks} from the server), ${withoutTarget} without target, ${failed} failed`);
+    }
+
+    // A superseded pass is not wasted when the text itself did not change: the ranges it computed are still
+    // exact, and dropping them is what leaves a scrolled file empty until the user stops moving.
+    private paintIfDocumentUnchanged(editor: vscode.TextEditor, entry: DecorationCacheEntry): void {
+        if (entry.documentVersion === editor.document.version) {
+            this.applyDecorations(editor);
+        }
+    }
+
+    /**
+     * Underlines come from this host's own program while F12 with the plugin installed goes through the
+     * server, so the two can disagree. When the local program finds nothing, ask the server - the same
+     * query F12 makes - instead of silently leaving the literal without an underline.
+     */
+    private async findServerDecorationTarget(
+        document: vscode.TextDocument,
+        literal: LiteralCandidate,
+        entry: DecorationCacheEntry,
+        allowedByBudget: boolean,
+        trace?: DefinitionTrace
+    ): Promise<vscode.Location | undefined> {
+        const position = literal.positions[0];
+        const cacheKey = rangeCacheKey(literal.range);
+
+        if (!tsServerPluginConfigured || !allowedByBudget || entry.withoutTarget.has(cacheKey)) {
+            return undefined;
+        }
+
+        // Module specifiers resolve natively, which is not what a string link means here.
+        if (isNativeModuleSpecifierPosition(document, position)) {
+            return undefined;
+        }
+
+        const targets = await queryServerDefinitionTargets(document, position);
+        const target = targets.find((candidate) => !isNodeModulesUri(candidate.uri));
+        if (!target) {
+            entry.withoutTarget.add(cacheKey);
+            return undefined;
+        }
+
+        traceLog(trace, `server resolved ${literal.range.start.line + 1}:${literal.range.start.character + 1} to ${target.uri.fsPath}:${target.range.start.line + 1}`);
+        return target;
     }
 
     private getDecorationCacheEntry(document: vscode.TextDocument): DecorationCacheEntry {
@@ -615,6 +843,7 @@ class StringLiteralLinkDecorator implements vscode.Disposable {
         const next: DecorationCacheEntry = {
             documentVersion: document.version,
             decorations: new Map<string, CachedDecoration>(),
+            withoutTarget: new Set<string>(),
         };
         this.decorationCache.set(key, next);
         return next;
@@ -622,15 +851,49 @@ class StringLiteralLinkDecorator implements vscode.Disposable {
 }
 
 function shouldProcessDocument(document: vscode.TextDocument): boolean {
-    return SUPPORTED_LANGUAGES.has(document.languageId) && document.uri.scheme === 'file';
+    if (SUPPORTED_LANGUAGES.has(document.languageId) && document.uri.scheme === 'file') {
+        return true;
+    }
+
+    reportSkippedDocument(document);
+    return false;
+}
+
+// A file the decorator refuses is a silent no-underline, so report each distinct one once.
+function reportSkippedDocument(document: vscode.TextDocument): void {
+    const key = `${document.uri.toString()}|${document.languageId}|${document.uri.scheme}`;
+    if (skippedDocumentReport.has(key)) {
+        return;
+    }
+
+    skippedDocumentReport.add(key);
+    log(`no decorations for ${document.uri.fsPath} (languageId="${document.languageId}", scheme=${document.uri.scheme})`);
+}
+
+function isValidDecorationRange(document: vscode.TextDocument, range: vscode.Range): boolean {
+    if (range.start.line < 0 || range.end.line >= document.lineCount || range.end.line < range.start.line) {
+        return false;
+    }
+
+    const endLineText = document.lineAt(range.end.line).text;
+    if (range.start.character < 0 || range.end.character > endLineText.length) {
+        return false;
+    }
+
+    return range.start.line !== range.end.line || range.end.character >= range.start.character;
 }
 
 function collectVisibleLiteralCandidates(editor: vscode.TextEditor): LiteralCandidate[] {
     const candidates: LiteralCandidate[] = [];
     const seen = new Set<string>();
+    const lastLine = editor.document.lineCount - 1;
 
     for (const visibleRange of editor.visibleRanges) {
-        for (let lineNumber = visibleRange.start.line; lineNumber <= visibleRange.end.line; lineNumber++) {
+        for (let lineNumber = visibleRange.start.line; lineNumber <= Math.min(visibleRange.end.line, lastLine); lineNumber++) {
+            if (lineNumber < 0) {
+                continue;
+            }
+
             const line = editor.document.lineAt(lineNumber);
             let startCharacter = 0;
             let endCharacter = line.text.length;
@@ -724,7 +987,7 @@ function findDeclarationNameRangeAtPosition(document: vscode.TextDocument, posit
         return undefined;
     }
 
-    const sourceFile = ts.createSourceFile(document.fileName, document.getText(), ts.ScriptTarget.Latest, true, scriptKindFor(document));
+    const sourceFile = getDocumentSourceFile(document);
     const node = findTsNodeAtOffset(ts, sourceFile, document.offsetAt(position));
     if (!node) {
         return undefined;
@@ -774,7 +1037,7 @@ function shouldUseExtensionDefinitionProvider(document: vscode.TextDocument, pos
 }
 
 function isNativeModuleSpecifierPosition(document: vscode.TextDocument, position: vscode.Position): boolean {
-    const sourceFile = ts.createSourceFile(document.fileName, document.getText(), ts.ScriptTarget.Latest, true, scriptKindFor(document));
+    const sourceFile = getDocumentSourceFile(document);
     const node = findTsNodeAtOffset(ts, sourceFile, document.offsetAt(position));
     if (!node || (!ts.isStringLiteral(node) && !ts.isNoSubstitutionTemplateLiteral(node))) {
         return false;
@@ -848,6 +1111,10 @@ async function provideFallbackDefinition(
         return undefined;
     }
 
+    if (delegatingDefinitionLookup) {
+        return undefined;
+    }
+
     if (!shouldUseExtensionDefinitionProvider(document, position)) {
         return undefined;
     }
@@ -869,11 +1136,14 @@ async function provideFallbackDefinition(
     }
 
     const customLookupStart = now();
-    const locations = await provideCustomDefinitionsNearPosition(document, position, program, trace, {
-        allowExternalFallback: false,
+    // The same fallback chain the F12 command uses: a declaration's references are not confined to the
+    // project that owns the file, so cmd+click has to look at the workspace too.
+    const locations = await provideCustomDefinitions(document, position, program, {
+        allowExternalFallback: true,
         cancellationToken,
+        trace,
     });
-    traceLog(trace, `provideCustomDefinitionsNearPosition took ${now() - customLookupStart}ms and returned ${locations.length} result(s)`);
+    traceLog(trace, `provideCustomDefinitions took ${now() - customLookupStart}ms and returned ${locations.length} result(s)`);
     if (locations.length === 0) {
         traceLog(trace, `finished with no custom result in ${now() - trace.startedAt}ms`);
         return undefined;
@@ -920,40 +1190,30 @@ async function provideCustomDefinitions(
 
     const resolver = semanticResolver.findCustomDefinition;
     if (!resolver || !program) {
-        if (document.isDirty || !allowExternalFallback) {
+        if (!allowExternalFallback) {
             return [];
         }
 
-        const diskLocations = await provideCustomDefinitionsFromDisk(document, position, trace);
-        if (diskLocations.length > 0 || isLookupCancelled(cancellationToken)) {
-            return diskLocations;
-        }
-
-        return provideCustomDefinitionsFromProbe(document, position, trace);
+        return provideExternalCustomDefinitionsNearPosition(document, position, trace, cancellationToken);
     }
 
     const resolverStart = now();
-    const state = resolver(ts, program, document.uri.fsPath, document.offsetAt(position));
+    // The reverse search checks the whole local program; when the tsserver plugin is loaded it
+    // already answers these queries against the server's own incremental program.
+    const state = resolver(ts, program, document.uri.fsPath, document.offsetAt(position), {
+        reverse: options.allowReverse !== false && !tsServerPluginConfigured,
+    });
     const definitions = state.definitions ?? (state.definition ? [state.definition] : []);
     traceLog(
         trace,
         `semanticResolver.findCustomDefinition at ${position.line + 1}:${position.character + 1} took ${now() - resolverStart}ms and returned ${definitions.length} definition(s)`
     );
     if (definitions.length === 0) {
-        if (document.isDirty || !allowExternalFallback) {
+        if (!allowExternalFallback) {
             return [];
         }
 
-        if (isLookupCancelled(cancellationToken)) {
-            return [];
-        }
-
-        const diskLocations = await provideCustomDefinitionsFromDisk(document, position, trace);
-        if (diskLocations.length > 0 || isLookupCancelled(cancellationToken)) {
-            return diskLocations;
-        }
-
-        return provideCustomDefinitionsFromProbe(document, position, trace);
+        return provideExternalCustomDefinitionsNearPosition(document, position, trace, cancellationToken);
     }
 
     if (isLookupCancelled(cancellationToken)) {
@@ -1070,65 +1330,91 @@ async function provideExternalCustomDefinitionsNearPosition(
     trace?: DefinitionTrace,
     cancellationToken?: vscode.CancellationToken
 ): Promise<vscode.Location[]> {
-    if (document.isDirty) {
+    const resolver = semanticResolver.findCustomDefinition;
+    if (!resolver) {
         return [];
+    }
+
+    const candidates = getLiteralCandidatePositions(document, position);
+    if (candidates.length === 0) {
+        return [];
+    }
+
+    traceLog(trace, `running shared external fallback for ${candidates.length} candidate position(s)`);
+
+    // Programs read from disk can only be trusted while the buffer matches the file, but the workspace
+    // program below is built from the buffers, so a dirty document is not a reason to give up.
+    if (!document.isDirty) {
+        const diskProgramStart = now();
+        const diskProgram = createProgramForFilePath(document.uri.fsPath, document.languageId);
+        traceLog(trace, `shared createProgramForFilePath took ${now() - diskProgramStart}ms (${diskProgram ? 'ok' : 'none'})`);
+        if (diskProgram) {
+            const diskSourceText = readFileSync(document.uri.fsPath, 'utf-8');
+            for (const candidatePosition of candidates) {
+                if (isLookupCancelled(cancellationToken)) {
+                    return [];
+                }
+
+                const diskCandidateStart = now();
+                const diskLocations = await provideCustomDefinitionsFromExistingProgram(document, candidatePosition, diskProgram, diskSourceText, trace, 'disk');
+                traceLog(
+                    trace,
+                    `shared disk candidate ${candidatePosition.line + 1}:${candidatePosition.character + 1} took ${now() - diskCandidateStart}ms and returned ${diskLocations.length} result(s)`
+                );
+                if (diskLocations.length > 0) {
+                    return diskLocations;
+                }
+            }
+        }
+
+        const probeProgramStart = now();
+        const probeProgram = createProgramForProbe(document.uri.fsPath);
+        traceLog(trace, `shared createProgramForProbe took ${now() - probeProgramStart}ms (${probeProgram ? 'ok' : 'none'})`);
+        if (probeProgram) {
+            const probeSourceText = readFileSync(document.uri.fsPath, 'utf-8');
+            for (const candidatePosition of candidates) {
+                if (isLookupCancelled(cancellationToken)) {
+                    return [];
+                }
+
+                const probeCandidateStart = now();
+                const probeLocations = await provideCustomDefinitionsFromExistingProgram(document, candidatePosition, probeProgram, probeSourceText, trace, 'probe');
+                traceLog(
+                    trace,
+                    `shared probe candidate ${candidatePosition.line + 1}:${candidatePosition.character + 1} took ${now() - probeCandidateStart}ms and returned ${probeLocations.length} result(s)`
+                );
+                if (probeLocations.length > 0) {
+                    return probeLocations;
+                }
+            }
+        }
     }
 
     if (isLookupCancelled(cancellationToken)) {
         return [];
     }
 
-    const candidates = getLiteralCandidatePositions(document, position);
-    const resolver = semanticResolver.findCustomDefinition;
-    if (!resolver) {
+    const workspaceProgramStart = now();
+    const workspaceProgram = await createWorkspaceProgram(document, trace);
+    traceLog(trace, `shared createWorkspaceProgram took ${now() - workspaceProgramStart}ms (${workspaceProgram ? 'ok' : 'none'})`);
+    if (!workspaceProgram) {
         return [];
     }
 
-    traceLog(trace, `running shared external fallback for ${candidates.length} candidate position(s)`);
-
-    const diskProgramStart = now();
-    const diskProgram = createProgramForFilePath(document.uri.fsPath, document.languageId);
-    traceLog(trace, `shared createProgramForFilePath took ${now() - diskProgramStart}ms (${diskProgram ? 'ok' : 'none'})`);
-    if (diskProgram) {
-        const diskSourceText = readFileSync(document.uri.fsPath, 'utf-8');
-        for (const candidatePosition of candidates) {
-            if (isLookupCancelled(cancellationToken)) {
-                return [];
-            }
-
-            const diskCandidateStart = now();
-            const diskLocations = await provideCustomDefinitionsFromExistingProgram(document, candidatePosition, diskProgram, diskSourceText, trace, 'disk');
-            traceLog(
-                trace,
-                `shared disk candidate ${candidatePosition.line + 1}:${candidatePosition.character + 1} took ${now() - diskCandidateStart}ms and returned ${diskLocations.length} result(s)`
-            );
-            if (diskLocations.length > 0) {
-                return diskLocations;
-            }
-        }
-    }
-
-    const probeProgramStart = now();
-    const probeProgram = createProgramForProbe(document.uri.fsPath);
-    traceLog(trace, `shared createProgramForProbe took ${now() - probeProgramStart}ms (${probeProgram ? 'ok' : 'none'})`);
-    if (!probeProgram) {
-        return [];
-    }
-
-    const probeSourceText = readFileSync(document.uri.fsPath, 'utf-8');
+    const documentText = document.getText();
     for (const candidatePosition of candidates) {
         if (isLookupCancelled(cancellationToken)) {
             return [];
         }
 
-        const probeCandidateStart = now();
-        const probeLocations = await provideCustomDefinitionsFromExistingProgram(document, candidatePosition, probeProgram, probeSourceText, trace, 'probe');
+        const workspaceCandidateStart = now();
+        const workspaceLocations = await provideCustomDefinitionsFromExistingProgram(document, candidatePosition, workspaceProgram, documentText, trace, 'workspace');
         traceLog(
             trace,
-            `shared probe candidate ${candidatePosition.line + 1}:${candidatePosition.character + 1} took ${now() - probeCandidateStart}ms and returned ${probeLocations.length} result(s)`
+            `shared workspace candidate ${candidatePosition.line + 1}:${candidatePosition.character + 1} took ${now() - workspaceCandidateStart}ms and returned ${workspaceLocations.length} result(s)`
         );
-        if (probeLocations.length > 0) {
-            return probeLocations;
+        if (workspaceLocations.length > 0) {
+            return workspaceLocations;
         }
     }
 
@@ -1141,7 +1427,7 @@ async function provideCustomDefinitionsFromExistingProgram(
     program: ts.Program,
     sourceText: string,
     trace: DefinitionTrace | undefined,
-    sourceLabel: 'disk' | 'probe'
+    sourceLabel: 'disk' | 'probe' | 'workspace'
 ): Promise<vscode.Location[]> {
     const resolver = semanticResolver.findCustomDefinition;
     if (!resolver) {
@@ -1149,7 +1435,10 @@ async function provideCustomDefinitionsFromExistingProgram(
     }
 
     const resolverStart = now();
-    const state = resolver(ts, program, document.uri.fsPath, offsetAtPositionInText(sourceText, position));
+    // The workspace program exists to answer what the server's project cannot see, so it always searches
+    // both directions; the narrower programs leave the reverse direction to the plugin when it is loaded.
+    const reverse = sourceLabel === 'workspace' ? true : !tsServerPluginConfigured;
+    const state = resolver(ts, program, document.uri.fsPath, offsetAtPositionInText(sourceText, position), { reverse });
     const definitions = state.definitions ?? (state.definition ? [state.definition] : []);
     traceLog(trace, `${sourceLabel} resolver lookup took ${now() - resolverStart}ms and returned ${definitions.length} definition(s)`);
     if (definitions.length === 0) {
@@ -1162,64 +1451,14 @@ async function provideCustomDefinitionsFromExistingProgram(
     return dedupeLocations(locations.filter((location): location is vscode.Location => location !== undefined));
 }
 
-async function provideCustomDefinitionsFromDisk(document: vscode.TextDocument, position: vscode.Position, trace?: DefinitionTrace): Promise<vscode.Location[]> {
-    const resolver = semanticResolver.findCustomDefinition;
-
-    const programStart = now();
-    const program = createProgramForFilePath(document.uri.fsPath, document.languageId);
-    traceLog(trace, `createProgramForFilePath took ${now() - programStart}ms (${program ? 'ok' : 'none'})`);
-    if (!resolver || !program) {
-        return [];
-    }
-
-    const sourceText = readFileSync(document.uri.fsPath, 'utf-8');
-
-    const resolverStart = now();
-    const state = resolver(ts, program, document.uri.fsPath, offsetAtPositionInText(sourceText, position));
-    const definitions = state.definitions ?? (state.definition ? [state.definition] : []);
-    traceLog(trace, `disk resolver lookup took ${now() - resolverStart}ms and returned ${definitions.length} definition(s)`);
-    if (definitions.length === 0) {
-        return [];
-    }
-
-    const locationConversionStart = now();
-    const locations = await Promise.all(definitions.map((definition) => definitionInfoToLocation(definition, trace)));
-    traceLog(trace, `disk definitionInfoToLocation conversion took ${now() - locationConversionStart}ms`);
-    return dedupeLocations(locations.filter((location): location is vscode.Location => location !== undefined));
-}
-
-async function provideCustomDefinitionsFromProbe(document: vscode.TextDocument, position: vscode.Position, trace?: DefinitionTrace): Promise<vscode.Location[]> {
-    const resolver = semanticResolver.findCustomDefinition;
-
-    const programStart = now();
-    const program = createProgramForProbe(document.uri.fsPath);
-    traceLog(trace, `createProgramForProbe took ${now() - programStart}ms (${program ? 'ok' : 'none'})`);
-    if (!resolver || !program) {
-        return [];
-    }
-
-    const sourceText = readFileSync(document.uri.fsPath, 'utf-8');
-
-    const resolverStart = now();
-    const state = resolver(ts, program, document.uri.fsPath, offsetAtPositionInText(sourceText, position));
-    const definitions = state.definitions ?? (state.definition ? [state.definition] : []);
-    traceLog(trace, `probe resolver lookup took ${now() - resolverStart}ms and returned ${definitions.length} definition(s)`);
-    if (definitions.length === 0) {
-        return [];
-    }
-
-    const locationConversionStart = now();
-    const locations = await Promise.all(definitions.map((definition) => definitionInfoToLocation(definition, trace)));
-    traceLog(trace, `probe definitionInfoToLocation conversion took ${now() - locationConversionStart}ms`);
-    return dedupeLocations(locations.filter((location): location is vscode.Location => location !== undefined));
-}
-
 function dedupeLocations(locations: readonly vscode.Location[]): vscode.Location[] {
     const seen = new Set<string>();
     const unique: vscode.Location[] = [];
 
     for (const location of locations) {
-        const key = `${location.uri.toString()}:${location.range.start.line}:${location.range.start.character}:${location.range.end.line}:${location.range.end.character}`;
+        // Keyed with normalizeFileName so the same target found through two programs - or reported with a
+        // different casing - collapses into one entry instead of showing up twice in the peek.
+        const key = `${normalizeFileName(location.uri.fsPath)}:${location.range.start.line}:${location.range.start.character}:${location.range.end.line}:${location.range.end.character}`;
         if (seen.has(key)) {
             continue;
         }
@@ -1232,19 +1471,34 @@ function dedupeLocations(locations: readonly vscode.Location[]): vscode.Location
 }
 
 function findTsNodeAtOffset(tsModule: typeof ts, sourceFile: ts.SourceFile, offset: number): ts.Node | undefined {
-    let current: ts.Node | undefined;
+    if (offset < sourceFile.getFullStart() || offset >= sourceFile.getEnd()) {
+        return undefined;
+    }
 
-    const visit = (node: ts.Node): void => {
-        if (offset < node.getFullStart() || offset >= node.getEnd()) {
-            return;
+    let current: ts.Node = sourceFile;
+
+    while (true) {
+        const child = findChildContainingOffset(tsModule, current, offset);
+        if (!child) {
+            return current;
         }
 
-        current = node;
-        tsModule.forEachChild(node, visit);
-    };
+        current = child;
+    }
+}
 
-    visit(sourceFile);
-    return current;
+// Sibling ranges never overlap, so descending one level at a time replaces walking every
+// descendant of the file for each lookup.
+function findChildContainingOffset(tsModule: typeof ts, parent: ts.Node, offset: number): ts.Node | undefined {
+    let match: ts.Node | undefined;
+
+    tsModule.forEachChild(parent, (child) => {
+        if (offset >= child.getFullStart() && offset < child.getEnd()) {
+            match = child;
+        }
+    });
+
+    return match;
 }
 
 function unwrapQueryBuilderBaseExpression(tsModule: typeof ts, expression: ts.Expression): ts.Expression | undefined {
@@ -1310,6 +1564,56 @@ function getPropertyNameTextLocal(tsModule: typeof ts, name: ts.PropertyName | t
     return undefined;
 }
 
+/**
+ * Serves the document from its buffer (unsaved edits included) and everything else from disk, preferring
+ * the buffer of any other open document so a lookup never runs against text the user has already changed.
+ */
+function createDocumentCompilerHost(document: vscode.TextDocument, options: ts.CompilerOptions): ts.CompilerHost {
+    const normalizedFileName = normalizeFileName(document.uri.fsPath);
+    const documentText = document.getText();
+    const host = ts.createCompilerHost(options, true);
+
+    const textFor = (candidate: string): string | undefined => {
+        if (normalizeFileName(candidate) === normalizedFileName) {
+            return documentText;
+        }
+
+        return openDocumentText(candidate) ?? ts.sys.readFile(candidate);
+    };
+
+    host.fileExists = (candidate) => normalizeFileName(candidate) === normalizedFileName || openDocumentText(candidate) !== undefined || ts.sys.fileExists(candidate);
+    host.readFile = (candidate) => textFor(candidate);
+    host.getSourceFile = (candidate, languageVersion, onError) => {
+        const sourceText = textFor(candidate);
+        if (sourceText === undefined) {
+            onError?.(`File not found: ${candidate}`);
+            return undefined;
+        }
+
+        const reusableSourceFile = getReusableSourceFile(candidate, sourceText);
+        if (reusableSourceFile) {
+            return reusableSourceFile;
+        }
+
+        const scriptKind = normalizeFileName(candidate) === normalizedFileName ? scriptKindFor(document) : scriptKindForFileName(candidate);
+        return rememberSourceFile(candidate, sourceText, ts.createSourceFile(candidate, sourceText, languageVersion, true, scriptKind));
+    };
+
+    return host;
+}
+
+function openDocumentText(fileName: string): string | undefined {
+    const normalized = normalizeFileName(fileName);
+
+    for (const open of vscode.workspace.textDocuments) {
+        if (normalizeFileName(open.uri.fsPath) === normalized) {
+            return open.getText();
+        }
+    }
+
+    return undefined;
+}
+
 function createProgramForDocument(document: vscode.TextDocument, trace?: DefinitionTrace): ts.Program | undefined {
     const fileName = document.uri.fsPath;
     const normalizedFileName = normalizeFileName(fileName);
@@ -1348,46 +1652,20 @@ function createProgramForDocument(document: vscode.TextDocument, trace?: Definit
         };
     }
 
-    const host = ts.createCompilerHost(options, true);
-    const documentText = document.getText();
+    const host = createDocumentCompilerHost(document, options);
 
-    host.fileExists = (candidate) => {
-        if (normalizeFileName(candidate) === normalizedFileName) {
-            return true;
-        }
-
-        return ts.sys.fileExists(candidate);
-    };
-
-    host.readFile = (candidate) => {
-        if (normalizeFileName(candidate) === normalizedFileName) {
-            return documentText;
-        }
-
-        return ts.sys.readFile(candidate);
-    };
-
-    host.getSourceFile = (candidate, languageVersion, onError) => {
-        if (normalizeFileName(candidate) === normalizedFileName) {
-            return ts.createSourceFile(candidate, documentText, languageVersion, true, scriptKindFor(document));
-        }
-
-        const sourceText = ts.sys.readFile(candidate);
-        if (sourceText === undefined) {
-            onError?.(`File not found: ${candidate}`);
-            return undefined;
-        }
-
-        return ts.createSourceFile(candidate, sourceText, languageVersion, true, scriptKindForFileName(candidate));
-    };
-
-    return setCachedProgram(documentProgramCache, cacheKey, ts.createProgram({ rootNames, options, host }));
+    const reuseKey = `${normalizedFileName}|${document.languageId}`;
+    const hostStart = now();
+    const program = ts.createProgram({ rootNames, options, host, oldProgram: previousProgramCache.get(reuseKey) });
+    traceLog(trace, `ts.createProgram took ${now() - hostStart}ms reusing ${sourceFileCache.size} cached source file(s)`);
+    rememberReusableProgram(reuseKey, program);
+    return setCachedProgram(documentProgramCache, cacheKey, program);
 }
 
 function createProgramForFilePath(fileName: string, languageId?: string, trace?: DefinitionTrace): ts.Program | undefined {
     const normalizedFileName = normalizeFileName(fileName);
     const cacheKey = `disk|${normalizedFileName}|${languageId ?? ''}`;
-    const cachedProgram = getCachedProgram(externalProgramCache, cacheKey);
+    const cachedProgram = getCachedProgram(externalProgramCache, cacheKey, true);
     if (cachedProgram) {
         traceLog(trace, 'createProgramForFilePath cache hit');
         return cachedProgram;
@@ -1420,13 +1698,14 @@ function createProgramForFilePath(fileName: string, languageId?: string, trace?:
         };
     }
 
-    return setCachedProgram(externalProgramCache, cacheKey, ts.createProgram({ rootNames, options }));
+    const program = ts.createProgram({ rootNames, options });
+    return setCachedProgram(externalProgramCache, cacheKey, program, programStamp(program));
 }
 
 function createProgramForProbe(fileName: string, trace?: DefinitionTrace): ts.Program | undefined {
     const normalizedFileName = normalizeFileName(fileName);
     const cacheKey = `probe|${normalizedFileName}`;
-    const cachedProgram = getCachedProgram(externalProgramCache, cacheKey);
+    const cachedProgram = getCachedProgram(externalProgramCache, cacheKey, true);
     if (cachedProgram) {
         traceLog(trace, 'createProgramForProbe cache hit');
         return cachedProgram;
@@ -1454,11 +1733,89 @@ function createProgramForProbe(fileName: string, trace?: DefinitionTrace): ts.Pr
         options = parsedConfig.options;
     }
 
-    return setCachedProgram(externalProgramCache, cacheKey, ts.createProgram({ rootNames, options }));
+    const program = ts.createProgram({ rootNames, options });
+    return setCachedProgram(externalProgramCache, cacheKey, program, programStamp(program));
 }
 
 function isJavaScriptDocument(languageId: string): boolean {
     return languageId === 'javascript' || languageId === 'javascriptreact';
+}
+
+const WORKSPACE_SOURCE_GLOB = '**/*.{ts,tsx,mts,cts}';
+const MAX_WORKSPACE_SOURCE_FILES = 4000;
+
+let workspaceSourceFilesPromise: Thenable<string[]> | undefined;
+
+/**
+ * A program over the whole workspace rather than over the project that owns the document. A folder the
+ * tsconfig excludes still contains files that reference the project's declarations, and the TypeScript
+ * server plugin only ever sees one project, so a lookup that finds nothing in the document's own program is
+ * retried against this one.
+ */
+async function createWorkspaceProgram(document: vscode.TextDocument, trace?: DefinitionTrace): Promise<ts.Program | undefined> {
+    const fileName = document.uri.fsPath;
+    const cacheKey = `workspace|${document.languageId}`;
+    const cachedProgram = getCachedProgram(externalProgramCache, cacheKey, true);
+    if (cachedProgram) {
+        traceLog(trace, 'createWorkspaceProgram cache hit');
+        return cachedProgram;
+    }
+
+    const configPath = ts.findConfigFile(path.dirname(fileName), ts.sys.fileExists);
+
+    let rootNames = [fileName];
+    let options: ts.CompilerOptions = {
+        strict: true,
+        target: ts.ScriptTarget.ES2022,
+        module: ts.ModuleKind.Node16,
+        moduleResolution: ts.ModuleResolutionKind.Node16,
+        allowJs: isJavaScriptDocument(document.languageId),
+        checkJs: false,
+        skipLibCheck: true,
+    };
+
+    if (configPath) {
+        const configFile = ts.readConfigFile(configPath, ts.sys.readFile);
+        if (configFile.error) {
+            return undefined;
+        }
+
+        const parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, path.dirname(configPath));
+        rootNames = parsedConfig.fileNames;
+        options = {
+            ...parsedConfig.options,
+            allowJs: parsedConfig.options.allowJs ?? isJavaScriptDocument(document.languageId),
+        };
+    }
+
+    const workspaceFiles = await getWorkspaceSourceFiles();
+    // Real casing here: these names end up in the locations we return, and a lowercased variant of an open
+    // file is a different URI to VS Code, so the user sees the same target twice.
+    const roots = new Set(rootNames);
+    roots.add(fileName);
+    for (const workspaceFile of workspaceFiles) {
+        roots.add(workspaceFile);
+    }
+
+    const host = createDocumentCompilerHost(document, options);
+    const reuseKey = `workspace|${document.languageId}`;
+    const hostStart = now();
+    const program = ts.createProgram({ rootNames: [...roots], options, host, oldProgram: previousProgramCache.get(reuseKey) });
+    traceLog(trace, `workspace ts.createProgram over ${roots.size} file(s) took ${now() - hostStart}ms`);
+    rememberReusableProgram(reuseKey, program);
+    return setCachedProgram(externalProgramCache, cacheKey, program, programStamp(program));
+}
+
+function getWorkspaceSourceFiles(): Thenable<string[]> {
+    workspaceSourceFilesPromise ??= vscode.workspace
+        .findFiles(WORKSPACE_SOURCE_GLOB, '**/node_modules/**', MAX_WORKSPACE_SOURCE_FILES)
+        .then((uris) => uris.map((uri) => uri.fsPath));
+
+    return workspaceSourceFilesPromise;
+}
+
+function forgetWorkspaceSourceFiles(): void {
+    workspaceSourceFilesPromise = undefined;
 }
 
 function scriptKindFor(document: vscode.TextDocument): ts.ScriptKind {
@@ -1496,11 +1853,87 @@ function normalizeFileName(fileName: string): string {
     return ts.sys.useCaseSensitiveFileNames ? fileName : fileName.toLowerCase();
 }
 
+function getReusableSourceFile(fileName: string, text: string): ts.SourceFile | undefined {
+    const key = normalizeFileName(fileName);
+    const cached = sourceFileCache.get(key);
+    if (!cached || cached.text !== text) {
+        return undefined;
+    }
+
+    sourceFileCache.delete(key);
+    sourceFileCache.set(key, cached);
+    return cached.sourceFile;
+}
+
+function rememberSourceFile(fileName: string, text: string, sourceFile: ts.SourceFile): ts.SourceFile {
+    const key = normalizeFileName(fileName);
+    const previous = sourceFileCache.get(key);
+    if (previous) {
+        cachedSourceFileBytes -= previous.text.length;
+        sourceFileCache.delete(key);
+    }
+
+    sourceFileCache.set(key, { text, sourceFile });
+    cachedSourceFileBytes += text.length;
+
+    while (sourceFileCache.size > MAX_CACHED_SOURCE_FILES || cachedSourceFileBytes > MAX_CACHED_SOURCE_FILE_BYTES) {
+        const oldestKey = sourceFileCache.keys().next().value;
+        if (oldestKey === undefined || oldestKey === key) {
+            break;
+        }
+
+        const oldest = sourceFileCache.get(oldestKey);
+        sourceFileCache.delete(oldestKey);
+        cachedSourceFileBytes -= oldest?.text.length ?? 0;
+    }
+
+    return sourceFile;
+}
+
+function rememberReusableProgram(key: string, program: ts.Program): void {
+    previousProgramCache.delete(key);
+    previousProgramCache.set(key, program);
+
+    while (previousProgramCache.size > MAX_REUSED_PROGRAMS) {
+        const oldestKey = previousProgramCache.keys().next().value;
+        if (oldestKey === undefined) {
+            break;
+        }
+
+        previousProgramCache.delete(oldestKey);
+    }
+}
+
+function getDocumentSourceFile(document: vscode.TextDocument): ts.SourceFile {
+    const key = document.uri.toString();
+    const cached = documentSourceFileCache.get(key);
+    if (cached && cached.version === document.version) {
+        return cached.sourceFile;
+    }
+
+    const sourceFile = ts.createSourceFile(document.fileName, document.getText(), ts.ScriptTarget.Latest, true, scriptKindFor(document));
+
+    if (!documentSourceFileCache.has(key)) {
+        while (documentSourceFileCache.size >= MAX_CACHED_DOCUMENT_SOURCE_FILES) {
+            const oldestKey = documentSourceFileCache.keys().next().value;
+            if (oldestKey === undefined) {
+                break;
+            }
+
+            documentSourceFileCache.delete(oldestKey);
+        }
+    }
+
+    documentSourceFileCache.set(key, { version: document.version, sourceFile });
+    return sourceFile;
+}
+
 function getStringJumpSettings(): StringJumpSettings {
     const configuration = vscode.workspace.getConfiguration('string-jump');
     return {
         hideDeclaration: configuration.get<boolean>('hide-declaration', true),
         hideImports: configuration.get<boolean>('hide-imports', true),
+        trace: configuration.get<boolean>('trace', false),
     };
 }
 
@@ -1524,6 +1957,7 @@ async function configureTsServerPlugin(options: { restartServer?: boolean; force
             hideDeclaration: settings.hideDeclaration,
             hideImports: settings.hideImports,
         });
+        tsServerPluginConfigured = true;
         log(`configured TypeScript plugin ${TSSERVER_PLUGIN_ID} with hideDeclaration=${settings.hideDeclaration} hideImports=${settings.hideImports}`);
 
         if (options.restartServer && (options.forceRestart || !tsServerRestartTriggered)) {
@@ -1562,7 +1996,7 @@ function isDeclarationTargetAtPosition(document: vscode.TextDocument, position: 
 async function isImportLocation(location: vscode.Location): Promise<boolean> {
     try {
         const document = await vscode.workspace.openTextDocument(location.uri);
-        const sourceFile = ts.createSourceFile(document.fileName, document.getText(), ts.ScriptTarget.Latest, true, scriptKindFor(document));
+        const sourceFile = getDocumentSourceFile(document);
         const node = findTsNodeAtOffset(ts, sourceFile, document.offsetAt(location.range.start));
         if (!node) {
             return false;

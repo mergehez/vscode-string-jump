@@ -35,7 +35,17 @@ export type CustomDefinitionState = {
     definitions?: DefinitionInfo[];
 };
 
-export type FindCustomDefinition = (ts: TSModule, program: TS.Program | undefined, fileName: string, position: number) => CustomDefinitionState;
+export type FindCustomDefinitionOptions = {
+    reverse?: boolean;
+};
+
+export type FindCustomDefinition = (
+    ts: TSModule,
+    program: TS.Program | undefined,
+    fileName: string,
+    position: number,
+    options?: FindCustomDefinitionOptions
+) => CustomDefinitionState;
 
 const pluginFactory: PluginModuleFactory = init;
 
@@ -138,7 +148,7 @@ function getCustomDefinitionState(ts: TSModule, info: PluginCreateInfo, fileName
     return findCustomDefinition(ts, program, fileName, position);
 }
 
-function findCustomDefinition(ts: TSModule, program: TS.Program | undefined, fileName: string, position: number): CustomDefinitionState {
+function findCustomDefinition(ts: TSModule, program: TS.Program | undefined, fileName: string, position: number, options?: FindCustomDefinitionOptions): CustomDefinitionState {
     if (!program) {
         return {};
     }
@@ -149,7 +159,7 @@ function findCustomDefinition(ts: TSModule, program: TS.Program | undefined, fil
     }
 
     for (const candidatePosition of getNearbyOffsets(sourceFile, position)) {
-        const state = findCustomDefinitionAtOffset(ts, program, sourceFile, candidatePosition);
+        const state = findCustomDefinitionAtOffset(ts, program, sourceFile, candidatePosition, options);
         if ((state.definitions?.length ?? 0) > 0 || state.definition) {
             return state;
         }
@@ -158,7 +168,7 @@ function findCustomDefinition(ts: TSModule, program: TS.Program | undefined, fil
     return {};
 }
 
-function findCustomDefinitionAtOffset(ts: TSModule, program: TS.Program, sourceFile: SourceFile, position: number): CustomDefinitionState {
+function findCustomDefinitionAtOffset(ts: TSModule, program: TS.Program, sourceFile: SourceFile, position: number, options?: FindCustomDefinitionOptions): CustomDefinitionState {
     const fileName = sourceFile.fileName;
 
     const node = findNodeAtOffset(ts, sourceFile, position);
@@ -180,6 +190,12 @@ function findCustomDefinitionAtOffset(ts: TSModule, program: TS.Program, sourceF
         }
     }
 
+    // The reverse search checks the whole program, so callers that only need literal
+    // targets ask for it to be skipped.
+    if (options?.reverse === false) {
+        return {};
+    }
+
     const declaration = resolveReverseDefinitionTarget(ts, checker, node);
     if (!declaration) {
         return {};
@@ -199,41 +215,280 @@ function findCustomDefinitionAtOffset(ts: TSModule, program: TS.Program, sourceF
     };
 }
 
+type ReverseReferenceKind = 'literal' | 'identifier' | 'property-access';
+
+type ReverseReferenceEntry = {
+    /** Span of the reference node; still valid while the file's text is unchanged. */
+    start: number;
+    length: number;
+    kind: ReverseReferenceKind;
+    /** Declaration the reference points at, identified by name so entries survive edits around it. */
+    targetFile: string;
+    targetName: string;
+};
+
+type ReverseReferenceFileIndex = {
+    text: string;
+    /** Bucketed by "target file + target name" so a lookup is a hash hit per file, not a scan. */
+    byTarget: Map<string, ReverseReferenceEntry[]>;
+};
+
+// References are indexed per file and kept for as long as that file's text is unchanged, so an edit only
+// costs the walk of the file that changed. Keying the index by the program snapshot instead threw every
+// entry away on each keystroke, which made the reverse lookup take seconds on a large project. Entries
+// store the referenced declaration's name rather than its span, so an edit that moves the declaration
+// cannot leave the index pointing at a stale position.
+const reverseReferenceFileIndexes = new Map<string, ReverseReferenceFileIndex>();
+const MAX_INDEXED_REFERENCE_FILES = 4000;
+
 function findReverseDefinitions(ts: TSModule, checker: TypeChecker, program: TS.Program, declaration: Declaration): DefinitionInfo[] {
-    const compilerOptions = program.getCompilerOptions();
-    const reverseDefinitions: DefinitionInfo[] = [];
-    const declarationTargetNode = getDefinitionTargetNode(declaration);
+    const targetNode = getDefinitionTargetNode(declaration);
+    const targetName = targetNode.getText(targetNode.getSourceFile());
+    const targetKey = declarationKey(declaration);
+
+    // A member is only ever referenced by its own name - as an identifier, a property access, or a string -
+    // so every other node in a file can be skipped without asking the checker about it. That is what keeps
+    // the lookup cheap on a file with a thousand lines, and on a program whose index is still cold.
+    if (isNameBoundReferenceDeclaration(ts, declaration)) {
+        return findNameBoundReferences(ts, checker, program, declaration, targetName, targetKey);
+    }
+
+    return findIndexedReferences(ts, checker, program, declaration, targetName, targetKey);
+}
+
+function isNameBoundReferenceDeclaration(ts: TSModule, declaration: Declaration): boolean {
+    return (
+        ts.isPropertyDeclaration(declaration) ||
+        ts.isPropertySignature(declaration) ||
+        ts.isPropertyAssignment(declaration) ||
+        ts.isMethodDeclaration(declaration) ||
+        ts.isMethodSignature(declaration) ||
+        ts.isGetAccessorDeclaration(declaration) ||
+        ts.isSetAccessorDeclaration(declaration) ||
+        ts.isEnumMember(declaration) ||
+        ts.isShorthandPropertyAssignment(declaration)
+    );
+}
+
+function findNameBoundReferences(ts: TSModule, checker: TypeChecker, program: TS.Program, declaration: Declaration, targetName: string, targetKey: string): DefinitionInfo[] {
+    const bucketKey = reverseReferenceLookupKey(declaration.getSourceFile().fileName, targetName);
+    const definitions: DefinitionInfo[] = [];
 
     for (const sourceFile of program.getSourceFiles()) {
-        if (sourceFile.isDeclarationFile || sourceFile.fileName.includes(`${path.sep}node_modules${path.sep}`)) {
+        if (shouldSkipReferenceSearchFile(sourceFile)) {
             continue;
         }
 
-        const visit = (node: TS.Node): void => {
-            if (isStringLiteralNode(ts, node)) {
-                const target = resolveLiteralTarget(ts, checker, compilerOptions, node);
-                if (target && declarationsMatch(target, declaration)) {
-                    reverseDefinitions.push(definitionInfoForNode(ts, node));
-                }
-            } else if (ts.isPropertyAccessExpression(node)) {
-                const target = resolveSelectedDeclaration(ts, checker, node.name);
-                if (target && declarationsMatch(target, declaration) && !isSameTargetNode(node.name, declarationTargetNode)) {
-                    reverseDefinitions.push(definitionInfoForNode(ts, node.name));
-                }
-            } else if (isReverseReferenceNode(ts, node)) {
-                const target = resolveSelectedDeclaration(ts, checker, node);
-                if (target && declarationsMatch(target, declaration) && !isSameTargetNode(node, declarationTargetNode)) {
-                    reverseDefinitions.push(definitionInfoForNode(ts, node));
+        const cached = getCachedFileReferenceIndex(sourceFile);
+        if (cached) {
+            for (const entry of cached.byTarget.get(bucketKey) ?? []) {
+                const node = findNodeAtOffset(ts, sourceFile, entry.start);
+                if (node && isReferenceToDeclaration(ts, checker, program, entry.kind, node, targetKey)) {
+                    definitions.push(definitionInfoForNode(ts, node));
                 }
             }
 
-            ts.forEachChild(node, visit);
-        };
+            continue;
+        }
 
-        visit(sourceFile);
+        // A reference to a member is written as the member's name, so a file that never mentions it cannot
+        // contain one - and most files in a project do not.
+        if (!sourceFile.text.includes(targetName)) {
+            continue;
+        }
+
+        definitions.push(...findNameBoundReferencesInFile(ts, checker, program, sourceFile, targetName, targetKey));
     }
 
-    return mergeDefinitions(reverseDefinitions, []);
+    return mergeDefinitions(definitions, []);
+}
+
+function findNameBoundReferencesInFile(ts: TSModule, checker: TypeChecker, program: TS.Program, sourceFile: SourceFile, targetName: string, targetKey: string): DefinitionInfo[] {
+    const compilerOptions = program.getCompilerOptions();
+    const definitions: DefinitionInfo[] = [];
+
+    const addReference = (target: Declaration | undefined, reference: TS.Node, kind: ReverseReferenceKind, skipTargetNode: boolean): void => {
+        if (!target || (skipTargetNode && isSameTargetNode(reference, getDefinitionTargetNode(target)))) {
+            return;
+        }
+
+        if (isReferenceToDeclaration(ts, checker, program, kind, reference, targetKey, target)) {
+            definitions.push(definitionInfoForNode(ts, reference));
+        }
+    };
+
+    const visit = (node: TS.Node): void => {
+        if (isStringLiteralNode(ts, node)) {
+            if (node.text === targetName) {
+                addReference(resolveLiteralTarget(ts, checker, compilerOptions, node), node, 'literal', false);
+            }
+        } else if (ts.isPropertyAccessExpression(node)) {
+            if (node.name.text === targetName) {
+                addReference(resolveSelectedDeclaration(ts, checker, node.name), node.name, 'property-access', true);
+            }
+        } else if (isReverseReferenceNode(ts, node) && node.text === targetName) {
+            addReference(resolveSelectedDeclaration(ts, checker, node), node, 'identifier', true);
+        }
+
+        ts.forEachChild(node, visit);
+    };
+
+    visit(sourceFile);
+    return definitions;
+}
+
+function findIndexedReferences(ts: TSModule, checker: TypeChecker, program: TS.Program, declaration: Declaration, targetName: string, targetKey: string): DefinitionInfo[] {
+    const bucketKey = reverseReferenceLookupKey(declaration.getSourceFile().fileName, targetName);
+    const definitions: DefinitionInfo[] = [];
+
+    for (const sourceFile of program.getSourceFiles()) {
+        if (shouldSkipReferenceSearchFile(sourceFile)) {
+            continue;
+        }
+
+        const entries = getFileReferenceIndex(ts, checker, program, sourceFile).byTarget.get(bucketKey);
+        if (!entries) {
+            continue;
+        }
+
+        for (const entry of entries) {
+            // The name filter is what survives edits, so confirm against the program in hand before
+            // reporting a reference: two declarations can share a name, and one can be renamed.
+            const node = findNodeAtOffset(ts, sourceFile, entry.start);
+            if (!node || !isReferenceToDeclaration(ts, checker, program, entry.kind, node, targetKey)) {
+                continue;
+            }
+
+            definitions.push(definitionInfoForNode(ts, node));
+        }
+    }
+
+    return mergeDefinitions(definitions, []);
+}
+
+function reverseReferenceLookupKey(targetFile: string, targetName: string): string {
+    return `${targetFile}\u0000${targetName}`;
+}
+
+function shouldSkipReferenceSearchFile(sourceFile: SourceFile): boolean {
+    return sourceFile.isDeclarationFile || sourceFile.fileName.includes(`${path.sep}node_modules${path.sep}`);
+}
+
+function getCachedFileReferenceIndex(sourceFile: SourceFile): ReverseReferenceFileIndex | undefined {
+    const cached = reverseReferenceFileIndexes.get(sourceFile.fileName);
+    if (!cached || !isSameFileContent(cached, sourceFile)) {
+        return undefined;
+    }
+
+    reverseReferenceFileIndexes.delete(sourceFile.fileName);
+    reverseReferenceFileIndexes.set(sourceFile.fileName, cached);
+    return cached;
+}
+
+function getFileReferenceIndex(ts: TSModule, checker: TypeChecker, program: TS.Program, sourceFile: SourceFile): ReverseReferenceFileIndex {
+    const cached = getCachedFileReferenceIndex(sourceFile);
+    if (cached) {
+        return cached;
+    }
+
+    const index: ReverseReferenceFileIndex = {
+        text: sourceFile.text,
+        byTarget: collectFileReferenceEntries(ts, checker, program, sourceFile),
+    };
+    reverseReferenceFileIndexes.delete(sourceFile.fileName);
+    reverseReferenceFileIndexes.set(sourceFile.fileName, index);
+
+    while (reverseReferenceFileIndexes.size > MAX_INDEXED_REFERENCE_FILES) {
+        const oldestKey = reverseReferenceFileIndexes.keys().next().value;
+        if (oldestKey === undefined) {
+            break;
+        }
+
+        reverseReferenceFileIndexes.delete(oldestKey);
+    }
+
+    return index;
+}
+
+// Unchanged files are normally the same source file object across program snapshots, which makes this a
+// pointer compare; a host that rebuilds files still gets a correct (if slower) content compare.
+function isSameFileContent(cached: ReverseReferenceFileIndex, sourceFile: SourceFile): boolean {
+    return cached.text === sourceFile.text;
+}
+
+function collectFileReferenceEntries(ts: TSModule, checker: TypeChecker, program: TS.Program, sourceFile: SourceFile): Map<string, ReverseReferenceEntry[]> {
+    const compilerOptions = program.getCompilerOptions();
+    const byTarget = new Map<string, ReverseReferenceEntry[]>();
+
+    const addEntry = (target: Declaration | undefined, reference: TS.Node, kind: ReverseReferenceKind, skipTargetNode: boolean): void => {
+        if (!target || (skipTargetNode && isSameTargetNode(reference, getDefinitionTargetNode(target)))) {
+            return;
+        }
+
+        const targetNode = getDefinitionTargetNode(target);
+        const targetFile = target.getSourceFile().fileName;
+        const targetName = targetNode.getText(targetNode.getSourceFile());
+        const entry: ReverseReferenceEntry = {
+            start: reference.getStart(sourceFile),
+            length: reference.getWidth(sourceFile),
+            kind,
+            targetFile,
+            targetName,
+        };
+        const key = reverseReferenceLookupKey(targetFile, targetName);
+        const bucket = byTarget.get(key);
+
+        if (bucket) {
+            bucket.push(entry);
+        } else {
+            byTarget.set(key, [entry]);
+        }
+    };
+
+    const visit = (node: TS.Node): void => {
+        if (isStringLiteralNode(ts, node)) {
+            addEntry(resolveLiteralTarget(ts, checker, compilerOptions, node), node, 'literal', false);
+        } else if (ts.isPropertyAccessExpression(node)) {
+            addEntry(resolveSelectedDeclaration(ts, checker, node.name), node.name, 'property-access', true);
+        } else if (isReverseReferenceNode(ts, node)) {
+            addEntry(resolveSelectedDeclaration(ts, checker, node), node, 'identifier', true);
+        }
+
+        ts.forEachChild(node, visit);
+    };
+
+    visit(sourceFile);
+    return byTarget;
+}
+
+function isReferenceToDeclaration(
+    ts: TSModule,
+    checker: TypeChecker,
+    program: TS.Program,
+    kind: ReverseReferenceKind,
+    node: TS.Node,
+    targetKey: string,
+    resolvedTarget?: Declaration
+): boolean {
+    if (kind === 'literal') {
+        if (!isStringLiteralNode(ts, node)) {
+            return false;
+        }
+
+        const target = resolvedTarget ?? resolveLiteralTarget(ts, checker, program.getCompilerOptions(), node);
+        return target !== undefined && declarationKey(target) === targetKey;
+    }
+
+    const target = resolvedTarget ?? resolveSelectedDeclaration(ts, checker, node);
+    if (!target || isSameTargetNode(node, getDefinitionTargetNode(target))) {
+        return false;
+    }
+
+    return declarationKey(target) === targetKey;
+}
+
+function declarationKey(declaration: Declaration): string {
+    return `${declaration.getSourceFile().fileName}:${declaration.getStart()}:${declaration.getEnd()}`;
 }
 
 function resolveReverseDefinitionTarget(ts: TSModule, checker: TypeChecker, node: TS.Node): Declaration | undefined {
@@ -313,14 +568,6 @@ function isNamedDeclarationParent(ts: TSModule, node: TS.Node): node is Declarat
         ts.isTypeParameterDeclaration(node) ||
         ts.isVariableDeclaration(node)
     );
-}
-
-function declarationsMatch(left: Declaration, right: Declaration): boolean {
-    if (left === right) {
-        return true;
-    }
-
-    return left.getSourceFile().fileName === right.getSourceFile().fileName && left.getStart() === right.getStart() && left.getEnd() === right.getEnd();
 }
 
 function mergeDefinitions(customDefinitions: readonly DefinitionInfo[], existingDefinitions: readonly DefinitionInfo[]): DefinitionInfo[] {
@@ -532,19 +779,34 @@ function isSameTargetNode(left: TS.Node, right: TS.Node): boolean {
 }
 
 function findNodeAtOffset(ts: TSModule, sourceFile: SourceFile, offset: number): TS.Node | undefined {
-    let current: TS.Node | undefined;
+    if (offset < sourceFile.getFullStart() || offset >= sourceFile.getEnd()) {
+        return undefined;
+    }
 
-    const visit = (node: TS.Node): void => {
-        if (offset < node.getFullStart() || offset >= node.getEnd()) {
-            return;
+    let current: TS.Node = sourceFile;
+
+    while (true) {
+        const child = findChildContainingOffset(ts, current, offset);
+        if (!child) {
+            return current;
         }
 
-        current = node;
-        ts.forEachChild(node, visit);
-    };
+        current = child;
+    }
+}
 
-    visit(sourceFile);
-    return current;
+// Sibling ranges never overlap, so descending one level at a time replaces walking every
+// descendant of the file for each lookup.
+function findChildContainingOffset(ts: TSModule, parent: TS.Node, offset: number): TS.Node | undefined {
+    let match: TS.Node | undefined;
+
+    ts.forEachChild(parent, (child) => {
+        if (offset >= child.getFullStart() && offset < child.getEnd()) {
+            match = child;
+        }
+    });
+
+    return match;
 }
 
 function isStringLiteralNode(ts: TSModule, node: TS.Node): node is StringLiteralNode {
@@ -561,14 +823,24 @@ function resolveLiteralTarget(ts: TSModule, checker: TypeChecker, compilerOption
 }
 
 function resolveCallArgumentTarget(ts: TSModule, checker: TypeChecker, compilerOptions: CompilerOptions, node: StringLiteralNode): Declaration | undefined {
-    const parent = node.parent;
+    // A column list passes its columns inside an array argument (`preload('relation', ['col', …])`), whose
+    // columns belong to the relation's model rather than to the call's own model.
+    const argumentNode = ts.isArrayLiteralExpression(node.parent) && node.parent.parent && ts.isCallExpression(node.parent.parent) ? node.parent : node;
+    const parent = argumentNode.parent;
     if (!parent || (!ts.isCallExpression(parent) && !ts.isNewExpression(parent))) {
         return undefined;
     }
 
-    const argumentIndex = parent.arguments?.findIndex((argument) => argument === node) ?? -1;
+    const argumentIndex = parent.arguments?.findIndex((argument) => argument === argumentNode) ?? -1;
     if (argumentIndex < 0) {
         return undefined;
+    }
+
+    if (argumentNode !== node) {
+        const relationColumnTarget = resolveRelationColumnTarget(ts, checker, parent, node.text);
+        if (relationColumnTarget) {
+            return relationColumnTarget;
+        }
     }
 
     const structuralPropertyTarget = resolvePropertyTargetFromCallContext(ts, checker, parent, argumentIndex, node.text);
@@ -608,6 +880,50 @@ function resolveCallArgumentTarget(ts: TSModule, checker: TypeChecker, compilerO
     }
 
     return declarationForTypeNode(ts, checker, declaration.type);
+}
+
+// `preload('relation', ['column', …])` and friends: the column names belong to the model the relation points
+// at, so the relation is resolved first and the columns are looked up on that model.
+function resolveRelationColumnTarget(ts: TSModule, checker: TypeChecker, callExpression: CallLikeExpression, propertyName: string): Declaration | undefined {
+    const [relationArgument] = callExpression.arguments ?? [];
+    if (!relationArgument || !isStringLiteralNode(ts, relationArgument) || !ts.isPropertyAccessExpression(callExpression.expression)) {
+        return undefined;
+    }
+
+    const relationDeclaration = resolvePropertyTargetFromCallReceiver(checker, callExpression.expression.expression, relationArgument.text);
+    if (!relationDeclaration) {
+        return undefined;
+    }
+
+    for (const relatedModelType of relationModelTypes(checker, relationDeclaration)) {
+        const target = resolvePropertyTargetFromType(checker, relatedModelType, propertyName);
+        if (target) {
+            return target;
+        }
+    }
+
+    return undefined;
+}
+
+/** The model a relation points at: the type argument of its declared type (`BelongsTo<typeof Model>`). */
+function relationModelTypes(checker: TypeChecker, declaration: Declaration): Type[] {
+    const declaredType = checker.getTypeAtLocation(declaration) as Type & { aliasTypeArguments?: Type[]; types?: Type[] };
+    const modelTypes: Type[] = [];
+
+    if (Array.isArray(declaredType.aliasTypeArguments)) {
+        modelTypes.push(...declaredType.aliasTypeArguments);
+    }
+
+    if (Array.isArray(declaredType.types)) {
+        for (const member of declaredType.types) {
+            const memberType = member as Type & { aliasTypeArguments?: Type[] };
+            if (Array.isArray(memberType.aliasTypeArguments)) {
+                modelTypes.push(...memberType.aliasTypeArguments);
+            }
+        }
+    }
+
+    return modelTypes;
 }
 
 function resolvePropertyTargetFromCallContext(
@@ -844,11 +1160,24 @@ function unwrapPromiseLikeType(checker: TypeChecker, type: Type): Type | undefin
 
 function resolvePropertyTargetFromType(checker: TypeChecker, type: Type, propertyName: string): Declaration | undefined {
     const property = checker.getPropertyOfType(checker.getApparentType(type), propertyName);
-    if (!property) {
-        return undefined;
+    if (property) {
+        return property.declarations?.[0];
     }
 
-    return property.declarations?.[0];
+    // A builder type carries its model as `typeof Model`, whose own properties are the statics; the columns
+    // (and relations) live on the instance type of that class.
+    const symbol = type.getSymbol();
+    if (symbol && type.getConstructSignatures().length > 0) {
+        const instanceType = checker.getDeclaredTypeOfSymbol(symbol);
+        if (instanceType !== type) {
+            const instanceProperty = checker.getPropertyOfType(checker.getApparentType(instanceType), propertyName);
+            if (instanceProperty) {
+                return instanceProperty.declarations?.[0];
+            }
+        }
+    }
+
+    return undefined;
 }
 
 function resolveTupleElementClassMemberTarget(ts: TSModule, checker: TypeChecker, expression: Expression, memberName: string): Declaration | undefined {
@@ -1240,9 +1569,26 @@ function resolveKeyofParameterTarget(
     return resolveObjectKeyTargetFromTypeNode(ts, checker, parameterTypeNode.type, node.text);
 }
 
-function resolvePropertyKeyTargetFromTypeNode(ts: TSModule, checker: TypeChecker, typeNode: TypeNode, propertyName: string): Declaration | undefined {
+function resolvePropertyKeyTargetFromTypeNode(ts: TSModule, checker: TypeChecker, typeNode: TypeNode, propertyName: string, depth = 0): Declaration | undefined {
+    if (depth > 8) {
+        return undefined;
+    }
+
     if (ts.isTypeOperatorNode(typeNode) && typeNode.operator === ts.SyntaxKind.KeyOfKeyword) {
         return resolveObjectKeyTargetFromTypeNode(ts, checker, typeNode.type, propertyName);
+    }
+
+    // `param: KeyAlias | { … }` and friends: the literal still names a property of one of the members, which
+    // is a better target than the union type that admits it.
+    if (ts.isUnionTypeNode(typeNode)) {
+        for (const member of typeNode.types) {
+            const target = resolvePropertyKeyTargetFromTypeNode(ts, checker, member, propertyName, depth + 1);
+            if (target) {
+                return target;
+            }
+        }
+
+        return undefined;
     }
 
     if (ts.isTypeReferenceNode(typeNode)) {
@@ -1252,7 +1598,7 @@ function resolvePropertyKeyTargetFromTypeNode(ts: TSModule, checker: TypeChecker
                 continue;
             }
 
-            const target = resolvePropertyKeyTargetFromTypeNode(ts, checker, declaration.type, propertyName);
+            const target = resolvePropertyKeyTargetFromTypeNode(ts, checker, declaration.type, propertyName, depth + 1);
             if (target) {
                 return target;
             }
