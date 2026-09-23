@@ -1,9 +1,11 @@
 /// <reference types="node" />
-import { execSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { buildExtension } from './build.ts';
+import { installExtensionToProfile } from './install.ts';
 
 const require = createRequire(import.meta.url);
 const ts = require('typescript') as typeof import('typescript');
@@ -45,6 +47,7 @@ const projectRoot = fileURLToPath(new URL('.', import.meta.url));
 const env = loadEnvFile(path.join(projectRoot, '.env'));
 
 const vsixFile = `string-jump-${packageJson.version}.vsix`;
+const testProfile = process.env.STRING_JUMP_TEST_PROFILE ?? env.STRING_JUMP_TEST_PROFILE ?? 'web';
 const skipBuild = process.argv.includes('-s');
 const skipE2E = process.argv.includes('--direct') || process.argv.includes('--no-e2e');
 const runExtensionAutoTest = process.argv.includes('--e2e');
@@ -158,10 +161,7 @@ async function autoRun() {
         }
 
         if (!skipBuild) {
-            const buildCommand = runExtensionAutoTest ? `bun run build --test=${testFile}:${testFileLine}:${testFileColumn}` : 'bun run build';
-            execSync(buildCommand, {
-                stdio: 'inherit',
-            });
+            buildExtension({ testTarget: runExtensionAutoTest ? `${testFile}:${testFileLine}:${testFileColumn}` : undefined });
         }
 
         const directResults = probeBuiltResolver(testFile, testFileLine, testFileColumn);
@@ -179,9 +179,7 @@ async function autoRun() {
         }
 
         if (!skipBuild) {
-            execSync(`code --install-extension ${vsixFile} --force --profile web`, {
-                stdio: 'inherit',
-            });
+            installExtensionToProfile({ profile: testProfile, vsixFile, build: false });
 
             console.log('Restarting the extension host so the freshly installed extension activates...');
             await restartExtensionHost();
