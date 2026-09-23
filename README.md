@@ -88,21 +88,33 @@ npm run compile
 Useful commands during development:
 
 - `npm run compile` builds the extension and the bundled TypeScript server plugin package.
+- `npm test` compiles and runs the test suite in `tests/` (no VS Code needed).
+- `npm run test:e2e` runs the editor-driven harness in `test.ts` (see Local Validation).
+- `npm run scan -- <file...>` prints what the resolver returns for every string literal in those files, which is handy on a real project.
+- `npm run compare -- <oldPlugin.cjs> <projectDir>` diffs those answers between the built plugin and an older build, to see the blast radius of a resolver change (`lost` must stay 0).
 - `npm run watch` runs TypeScript in watch mode.
 - `npm run package` creates a `.vsix` package.
+- `node build.ts --up` bumps the patch version in `package.json` before building.
+- `node install.ts --profile=web` builds the extension and installs the resulting `.vsix` into one VS Code profile (`--up` to bump the version, `--skip-build` to install the current package as-is, `--vsix=<file>` to pick a package explicitly).
 
 Press `F5` in VS Code to launch an Extension Development Host.
 
+## Tests
+
+The suite is self-contained: no VS Code and no local project required.
+
+- `tests/resolver.test.mjs` resolves literals in the fixture project under `tests/fixtures/project` and asserts where each one jumps: model columns, relation names, column lists of a relation, columns inside a related builder callback, union keys, and the strings that must stay unresolved. It also covers the reverse direction (a declaration name listing the literals that refer to it).
+- `tests/decorations.test.mjs` runs the built `dist/extension.js` against a stubbed `vscode` API (`tests/vscode-stub.mjs`) to check the underline pass: what gets underlined, that underlines survive an edit, that a pass still runs while the visible range keeps changing, that one failing lookup does not cost the pass its other underlines, that a literal the extension host cannot resolve is still underlined through the server with the answer cached, and that non-TypeScript documents are skipped.
+
+The decoration tests need a built `dist/`, which `npm test` produces first.
+
 ## Local Validation
 
-This repository uses a local harness instead of a VS Code integration test suite.
-
-- `npm test` runs `test.ts`
-
-The harness is meant for validating the resolver against a real local project. If you want to use it on your machine, create a `.env` file from `.env.example` and fill in the machine-specific values.
+This repository also ships an editor-driven harness for validating the resolver against a real local project. If you want to use it on your machine, create a `.env` file from `.env.example` and fill in the machine-specific values.
 
 ```bash
 cp .env.example .env
+npm run test:e2e
 ```
 
 Environment variables used by the local harness:
@@ -113,8 +125,10 @@ Environment variables used by the local harness:
   Path where the extension writes auto-test logs.
 - `STRING_JUMP_COMMAND_SERVER_URL`
   Command bridge used only by the optional editor-driven flow.
+- `STRING_JUMP_TEST_PROFILE`
+  VS Code profile the harness installs the built extension into. Defaults to `web`.
 
-`npm test` expects `.env` when no `--test=...` argument is provided.
+`npm run test:e2e` expects `.env` when no `--test=...` argument is provided.
 
 The optional editor-driven path uses the VS Code extension [VSCode Command Server](https://marketplace.visualstudio.com/items?itemName=crimson206.vscode-command-server). You only need `STRING_JUMP_COMMAND_SERVER_URL` if you want the harness to restart the extension host and drive those extra steps.
 

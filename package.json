@@ -1,7 +1,7 @@
 {
     "name": "string-jump",
     "displayName": "String Jump",
-    "version": "0.0.3",
+    "version": "0.0.14",
     "description": "Semantic navigation between string literals, declaration names, and definitions in TypeScript and JavaScript.",
     "keywords": [
         "string",
@@ -36,8 +36,11 @@
         "build": "node build.ts",
         "compile": "node build.ts",
         "watch": "tsc -w -p ./",
-        "pretest": "npm run compile",
-        "test": "node test.ts",
+        "pretest": "node build.ts --skip-package",
+        "test": "node --test tests/*.test.mjs",
+        "test:e2e": "node test.ts",
+        "scan": "node tests/scan.mjs",
+        "compare": "node tests/compare.mjs",
         "package": "npx vsce package",
         "publish": "npx vsce publish"
     },
@@ -74,6 +77,11 @@
                     "type": "boolean",
                     "default": true,
                     "description": "Hide import statements from definition results shown by String Jump."
+                },
+                "string-jump.trace": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Log per-lookup timing to the String Jump output channel for troubleshooting."
                 }
             }
         },
